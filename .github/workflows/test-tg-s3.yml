@@ -1,0 +1,376 @@
+name: Telegram S3 Rotating Relay Node
+
+on:
+  workflow_dispatch:
+    inputs:
+      cycle_count:
+        description: 'Relay cycle counter'
+        required: false
+        default: '0'
+      test_handover:
+        description: 'Shift duration in minutes (330 for prod, 10 for test)'
+        required: false
+        default: '330'
+      force:
+        description: 'Set to true to override healthz gate check'
+        required: false
+        default: 'false'
+  schedule:
+    # Safety watchdog: fires every 6 hours to resurrect the ring if an unexpected runner termination occurs
+    - cron: '15 */6 * * *'
+
+jobs:
+  gate:
+    name: Watchdog Liveness Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - name: Check Health & Concurrency Mutex
+        id: check
+        env:
+          MY_PAT: ${{ secrets.GITHUB_TOKEN }}
+          NEXT_PAT: ${{ secrets.NEXT_PAT }}
+        run: |
+          CYCLE="${{ github.event.inputs.cycle_count || '0' }}"
+          FORCE="${{ github.event.inputs.force || 'false' }}"
+          echo "Evaluating gate for event: ${{ github.event_name }}, repo: ${GITHUB_REPOSITORY}, cycle_count: ${CYCLE}, force: ${FORCE}..."
+
+          # M1: Single resurrector guard - only silver-demon61 executes scheduled watchdog
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            if [ "${GITHUB_REPOSITORY}" != "silver-demon61/s3-relay-ring" ]; then
+              echo "Watchdog cron disabled on secondary repo ${GITHUB_REPOSITORY}. Sole watchdog is silver-demon61."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          # Probe helper: 3x probes with 10s intervals (2/3 DOWN quorum needed to conclude DOWN)
+          probe_healthz_quorum() {
+            local up_count=0
+            for i in 1 2 3; do
+              local code
+              code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 4 --max-time 8 https://s3.justsawyou.cyou/healthz || echo "000")
+              echo "  Probe $i/3 -> HTTP $code"
+              if [ "$code" = "200" ]; then
+                up_count=$(( up_count + 1 ))
+              fi
+              if [ "$i" -lt 3 ]; then
+                sleep 10
+              fi
+            done
+            # If at least 2 of 3 probes returned 200, it's ALIVE
+            if [ "$up_count" -ge 2 ]; then
+              return 0
+            else
+              return 1
+            fi
+          }
+
+          # Check if either ring repo has in_progress or queued runs (excluding this current run)
+          check_active_runs() {
+            local current_run_id="${GITHUB_RUN_ID}"
+            local repos=(
+              "silver-demon61/s3-relay-ring"
+              "synth-coder/s3-relay-ring"
+              "silver-demon60/s3-relay-ring"
+              "12stack-phantom/s3-relay-ring"
+            )
+            for r in "${repos[@]}"; do
+              local count
+              count=$(GH_TOKEN="${NEXT_PAT:-$MY_PAT}" gh run list --repo "$r" --workflow test-tg-s3.yml --status in_progress --json databaseId --jq "[.[] | select(.databaseId != ($current_run_id | tonumber))] | length" 2>/dev/null || echo "0")
+              if [ "$count" -gt 0 ]; then
+                echo "Detected $count concurrent in_progress run(s) on $r"
+                return 0
+              fi
+              local qcount
+              qcount=$(GH_TOKEN="${NEXT_PAT:-$MY_PAT}" gh run list --repo "$r" --workflow test-tg-s3.yml --status queued --json databaseId --jq "[.[] | select(.databaseId != ($current_run_id | tonumber))] | length" 2>/dev/null || echo "0")
+              if [ "$qcount" -gt 0 ]; then
+                echo "Detected $qcount concurrent queued run(s) on $r"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          # 1. Scheduled cron watchdog:
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "=== Cron Watchdog Triggered: Verifying Public S3 Health (M2 Sensor) ==="
+            if probe_healthz_quorum; then
+              echo "Relay ring is ALIVE (2/3 quorum 200). Skipping watchdog run."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            echo "Healthz probe returned DOWN. Verifying GitHub Actions active runs on both repos..."
+            if check_active_runs; then
+              echo "Relay run is actively running/queued on GitHub Actions. Suppressing resurrection."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            echo "Relay ring is truly DOWN and no runners active. Proceeding with resurrection."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 2. Manual workflow_dispatch:
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "$FORCE" = "true" ]; then
+              echo "Force override active. Bypassing gate."
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # M3: If cycle_count == 0 (manual launch or restart), suppress if ring is healthy
+            if [ "$CYCLE" = "0" ]; then
+              echo "=== Cycle 0 Triggered: Checking for Active Relay Conflict ==="
+              if probe_healthz_quorum; then
+                echo "::warning::Another relay node is ALREADY ACTIVE and healthy (HTTP 200). Aborting run to prevent duplicate MTProto session conflict!"
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              if check_active_runs; then
+                echo "::warning::Active relay runner already in progress or queued. Aborting duplicate launch!"
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "Ring is inactive. Clean to start Cycle 0."
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # For cycle_count > 0 dispatched by predecessor:
+            echo "Successor cycle $CYCLE proceeding."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+  s3-relay:
+    name: Run S3 Relay Node
+    needs: gate
+    if: needs.gate.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # =====================================================================
+      # PHASE 1: PRE-WARMING & SYSTEM INITIALIZATION
+      # =====================================================================
+      - name: Phase 1 - Pre-Warm Dependencies & Local Scratch
+        id: prewarm
+        run: |
+          set -euo pipefail
+          echo "=== PHASE 1: Pre-Warming System, Python MTProto & Cloudflare ==="
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            curl jq sqlite3 pigz gzip ca-certificates build-essential libssl-dev
+
+          # Install cloudflared official release
+          echo "Installing Cloudflare Tunnel daemon..."
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb
+          sudo dpkg -i /tmp/cloudflared.deb
+          rm -f /tmp/cloudflared.deb
+
+          # Setup local scratch NVMe storage (chown runner:runner)
+          sudo mkdir -p /tmp/s3_cache /tmp/s3_staging /tmp/s3_db
+          sudo chown -R runner:runner /tmp/s3_cache /tmp/s3_staging /tmp/s3_db
+
+          # Install Python dependencies with hardware AES-NI crypto (Pinned exact Telethon for MTProto internals)
+          pip3 install --upgrade pip
+          pip3 install aiohttp telethon==1.44.0 tgcrypto cryptg
+
+          echo "Pre-warming completed cleanly."
+
+      # =====================================================================
+      # PHASE 2: ATOMIC RESTORE, S3 GATEWAY & CLOUDFLARE INGRESS
+      # =====================================================================
+      - name: Phase 2 - Index Hydration & Service Activation
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
+          TG_STORAGE_CHANNEL: ${{ secrets.TG_STORAGE_CHANNEL }}
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+          DRAIN_TOKEN: ${{ secrets.DRAIN_TOKEN || 's3_relay_internal_drain_secret_token' }}
+          CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
+        run: |
+          set -euo pipefail
+          echo "=== PHASE 2: Exclusive Index Hydration & Service Activation ==="
+          CYCLE="${CYCLE_COUNT:-0}"
+
+          # Successor connects exclusively (predecessor is guaranteed already dead)
+          echo "Hydrating metadata index from Telegram pinned snapshot..."
+          python3 -m tg_s3.cli restore --db-path /tmp/s3_db/metadata.db
+
+          # Launch local aiohttp S3 Gateway on port 9000
+          export DRAIN_TOKEN="${DRAIN_TOKEN}"
+          nohup python3 -m tg_s3.cli run \
+            --host 127.0.0.1 \
+            --port 9000 \
+            --db-path /tmp/s3_db/metadata.db \
+            --cache-dir /tmp/s3_cache \
+            --staging-dir /tmp/s3_staging > /tmp/s3_server.log 2>&1 &
+
+          # Healthcheck local S3 gateway
+          echo "Awaiting S3 Gateway localhost:9000/healthz..."
+          GATEWAY_UP=false
+          for i in {1..30}; do
+            if curl -fsS http://localhost:9000/healthz > /dev/null 2>&1; then
+              echo "S3 Gateway online on localhost:9000 (${i}s)."
+              GATEWAY_UP=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$GATEWAY_UP" != "true" ]; then
+            echo "::error::S3 Gateway failed to start!"
+            cat /tmp/s3_server.log
+            exit 1
+          fi
+
+          # Start Cloudflare Tunnel (Instant edge cutover) if token present
+          if [ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
+            echo "Starting Cloudflare Tunnel daemon..."
+            sudo -u runner cloudflared tunnel run --token "$CLOUDFLARE_TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
+            sleep 3
+
+            echo "Verifying public Cloudflare S3 endpoint..."
+            for cf_chk in {1..30}; do
+              CF_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 2 https://s3.justsawyou.cyou/healthz || echo "000")
+              echo "Public check (${cf_chk}/30): HTTP ${CF_STATUS}"
+              if [ "$CF_STATUS" = "200" ]; then
+                echo "SUCCESS: s3.justsawyou.cyou is live and healthy!"
+                break
+              fi
+              sleep 2
+            done
+          fi
+
+      # =====================================================================
+      # PHASE 3: ACTIVE SHIFT & STRICT SEQUENTIAL HANDOVER
+      # =====================================================================
+      - name: Phase 3 - Active Shift & Strict Sequential Handover
+        env:
+          NEXT_PAT: ${{ secrets.NEXT_PAT }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
+          TG_STORAGE_CHANNEL: ${{ secrets.TG_STORAGE_CHANNEL }}
+          DRAIN_TOKEN: ${{ secrets.DRAIN_TOKEN || 's3_relay_internal_drain_secret_token' }}
+          CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
+          TEST_HANDOVER: ${{ github.event.inputs.test_handover }}
+        run: |
+          set -euo pipefail
+          SHIFT_MINS="${TEST_HANDOVER:-10}"
+          CYCLE="${CYCLE_COUNT:-0}"
+          NEXT_CYCLE=$(( CYCLE + 1 ))
+
+          echo "=== PHASE 3: Active Shift Running for ${SHIFT_MINS}m ==="
+          sleep $(( SHIFT_MINS * 60 ))
+
+          # -------------------------------------------------------------
+          # Step 1: Graceful S3 Write Drain (Non-fatal on partial failures)
+          # -------------------------------------------------------------
+          echo "=== [1/5] Initiating Graceful S3 Write Drain ==="
+          curl -fsS -X POST -H "Authorization: Bearer ${DRAIN_TOKEN}" http://localhost:9000/internal/drain || true
+          sleep 2
+
+          # -------------------------------------------------------------
+          # Step 2: Stop S3 Server Process
+          # -------------------------------------------------------------
+          echo "=== [2/5] Stopping S3 Server Process ==="
+          pkill -SIGINT -f "tg_s3.cli run" || true
+          TIMEOUT=30
+          while pgrep -f "tg_s3.cli run" > /dev/null && [ $TIMEOUT -gt 0 ]; do
+            sleep 1
+            TIMEOUT=$(( TIMEOUT - 1 ))
+          done
+          pkill -9 -f "tg_s3.cli run" 2>/dev/null || true
+
+          # -------------------------------------------------------------
+          # Step 3: Checkpoint WAL, Snapshot & Pin Index to Telegram
+          # -------------------------------------------------------------
+          echo "=== [3/5] Exporting & Pinning Index Snapshot to Telegram ==="
+          python3 -m tg_s3.cli snapshot \
+            --db-path /tmp/s3_db/metadata.db \
+            --cycle "$NEXT_CYCLE"
+
+          # Explicitly verify MTProto processes are dead before dispatching successor
+          pkill -9 -f "tg_s3.cli" 2>/dev/null || true
+          sleep 2
+
+          # -------------------------------------------------------------
+          # Step 4: Dispatch Successor Workflow Run & Verify (CRIT-4 Order)
+          # -------------------------------------------------------------
+          echo "=== [4/5] Dispatching Successor Workflow Run (Cycle $NEXT_CYCLE) ==="
+          REPOS=(
+            "silver-demon61/s3-relay-ring"
+            "synth-coder/s3-relay-ring"
+            "silver-demon60/s3-relay-ring"
+            "12stack-phantom/s3-relay-ring"
+          )
+          CURRENT_INDEX=0
+          for i in "${!REPOS[@]}"; do
+            if [ "${REPOS[$i]}" = "${GITHUB_REPOSITORY}" ]; then
+              CURRENT_INDEX=$i
+              break
+            fi
+          done
+          NEXT_INDEX=$(( (CURRENT_INDEX + 1) % ${#REPOS[@]} ))
+          TARGET_REPO="${REPOS[$NEXT_INDEX]}"
+
+          # M4: Idempotent dispatch check before each attempt
+          DISPATCH_SUCCESS=false
+          for attempt in 1 2 3 4 5; do
+            echo "Checking if run for cycle $NEXT_CYCLE is already queued or running on $TARGET_REPO..."
+            EXISTING=$(GH_TOKEN="$NEXT_PAT" gh run list --repo "$TARGET_REPO" --workflow test-tg-s3.yml --status in_progress --json databaseId --jq '. | length' 2>/dev/null || echo "0")
+            EXISTING_QUEUED=$(GH_TOKEN="$NEXT_PAT" gh run list --repo "$TARGET_REPO" --workflow test-tg-s3.yml --status queued --json databaseId --jq '. | length' 2>/dev/null || echo "0")
+            if [ "$EXISTING" -gt 0 ] || [ "$EXISTING_QUEUED" -gt 0 ]; then
+              echo "SUCCESS: Successor run already exists (in_progress: $EXISTING, queued: $EXISTING_QUEUED) on $TARGET_REPO. Skipping redundant dispatch."
+              DISPATCH_SUCCESS=true
+              break
+            fi
+
+            echo "Dispatch attempt $attempt/5 to $TARGET_REPO..."
+            if GH_TOKEN="$NEXT_PAT" gh workflow run test-tg-s3.yml \
+              --repo "$TARGET_REPO" \
+              --ref main \
+              -f cycle_count="$NEXT_CYCLE" \
+              -f test_handover="$SHIFT_MINS"; then
+              echo "SUCCESS: Successor dispatch API call succeeded on $TARGET_REPO."
+              DISPATCH_SUCCESS=true
+              break
+            fi
+            BACKOFF=$(( attempt * 5 ))
+            echo "Dispatch failed. Retrying in ${BACKOFF}s..."
+            sleep "$BACKOFF"
+          done
+
+          if [ "$DISPATCH_SUCCESS" != "true" ]; then
+            echo "::error::CRITICAL: Failed to dispatch successor after 5 attempts!"
+            exit 1
+          fi
+
+          # -------------------------------------------------------------
+          # Step 5: Disconnect Cloudflare Tunnel
+          # -------------------------------------------------------------
+          echo "=== [5/5] Disconnecting Cloudflare Tunnel ==="
+          sudo pkill -SIGTERM cloudflared 2>/dev/null || true
+          echo "Handover complete. Predecessor shutting down cleanly."
+
+      # =====================================================================
+      # PHASE 4: TEARDOWN CLEANUP
+      # =====================================================================
+      - name: Phase 4 - Teardown
+        if: always()
+        run: |
+          echo "=== PHASE 4: Teardown Cleanup ==="
+          sudo pkill -SIGTERM cloudflared 2>/dev/null || true
+          pkill -f "tg_s3.cli" 2>/dev/null || true
